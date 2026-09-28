@@ -1,0 +1,750 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# omarchyfile: describe an Omarchy setup in one file, then export, check, or
+# install it. The file is parsed, never executed, so a shared Omarchyfile can
+# only name things to install. It cannot run code of its own.
+
+require "json"
+require "open3"
+require "optparse"
+require "set"
+require "shellwords"
+require "strscan"
+require "tmpdir"
+
+module Omarchyfile
+  VERSION = "0.1.0"
+  OMARCHY_PATH = ENV.fetch("OMARCHY_PATH", "/usr/share/omarchy")
+  CATALOG_URL = "https://plugins.omarchy.org/catalog.json"
+  SECTIONS = %w[left center right].freeze
+
+  # Each command belongs to one category, which --only selects.
+  CATEGORIES = {
+    "theme" => "theme",
+    "pkg" => "packages", "aur" => "packages",
+    "webapp" => "webapps",
+    "plugin" => "plugins",
+    "widget" => "bar", "disable" => "bar",
+  }.freeze
+
+  Entry = Struct.new(:verb, :args, :opts, :line, keyword_init: true) do
+    def category = CATEGORIES.fetch(verb)
+  end
+
+  class Error < StandardError; end
+
+  # ------------------------------------------------------------------ parsing
+
+  # Reads the Brewfile-like syntax without evaluating it:
+  #   pkg "btop"
+  #   plugin "https://github.com/me/plugin", bar: "left", settings: {"size": 16}
+  module Parser
+    # verb => [number of positional values, allowed options]
+    SIGNATURES = {
+      "theme" => [1, %w[git]],
+      "pkg" => [1, []],
+      "aur" => [1, []],
+      "webapp" => [2, %w[icon]],
+      "plugin" => [1, %w[bar settings]],
+      "widget" => [1, %w[bar settings]],
+      "disable" => [1, []],
+    }.freeze
+    STRING = /"(?:[^"\\]|\\.)*"/
+    PACKAGE = /\A[a-z0-9@_+][a-z0-9@._+-]*\z/
+    HTTPS = %r{\Ahttps://[^\s"'`$\\]+\z}
+    BUILTIN = /\Aomarchy\.[a-z0-9][a-z0-9-]*\z/
+
+    module_function
+
+    def parse(text)
+      text.each_line.with_index(1).filter_map { |raw, n| parse_line(raw.chomp, n) }
+    end
+
+    def parse_line(raw, n)
+      s = StringScanner.new(raw)
+      s.skip(/\s*/)
+      return nil if s.eos? || s.check(/#/)
+
+      verb = s.scan(/[a-z_]+/) or fail_at(n, "expected a command such as pkg, webapp, or plugin")
+      arity, allowed = SIGNATURES[verb] || fail_at(n, "unknown command '#{verb}'")
+      args = []
+      opts = {}
+      first = true
+      loop do
+        s.skip(/[ \t]*/)
+        break if s.eos? || s.check(/#/)
+
+        unless first
+          s.skip(/,/) or fail_at(n, "expected a comma")
+          s.skip(/[ \t]*/)
+        end
+        first = false
+        if (key = s.scan(/[a-z_]+(?=:)/))
+          s.skip(/:[ \t]*/)
+          fail_at(n, "#{verb} does not take #{key}:") unless allowed.include?(key)
+          fail_at(n, "#{key}: is given twice") if opts.key?(key)
+          opts[key] = key == "settings" ? scan_object(s, n) : scan_string(s, n)
+        else
+          fail_at(n, "values must come before options such as bar:") unless opts.empty?
+          args << scan_string(s, n)
+        end
+      end
+      unless args.size == arity
+        fail_at(n, "#{verb} takes #{arity} quoted value#{"s" if arity > 1}, found #{args.size}")
+      end
+      validate(verb, args, opts, n)
+      Entry.new(verb: verb, args: args, opts: opts, line: n)
+    end
+
+    def scan_string(s, n)
+      token = s.scan(STRING) or fail_at(n, "expected a double-quoted value")
+      JSON.parse(token)
+    rescue JSON::ParserError
+      fail_at(n, "invalid quoted value #{token}")
+    end
+
+    # A JSON object; brace depth is tracked outside strings only.
+    def scan_object(s, n)
+      fail_at(n, "settings: must be an object like {\"key\": \"value\"}") unless s.check(/\{/)
+      depth = 0
+      out = +""
+      until s.eos?
+        if (str = s.scan(STRING))
+          out << str
+          next
+        end
+        ch = s.getch
+        out << ch
+        depth += 1 if ch == "{"
+        depth -= 1 if ch == "}"
+        break if depth.zero?
+      end
+      fail_at(n, "settings: is missing a closing }") unless depth.zero?
+      value = JSON.parse(out)
+      fail_at(n, "settings: must be an object") unless value.is_a?(Hash)
+      fail_at(n, "settings: cannot set id") if value.key?("id")
+      value
+    rescue JSON::ParserError => e
+      fail_at(n, "settings: is not valid JSON (#{e.message.lines.first.strip})")
+    end
+
+    def validate(verb, args, opts, n)
+      value = args.first
+      case verb
+      when "pkg", "aur"
+        fail_at(n, "'#{value}' is not a valid package name") unless value.match?(PACKAGE)
+      when "theme"
+        fail_at(n, "'#{value}' is not a valid theme name") unless value.match?(/\A[A-Za-z0-9][\w .-]*\z/)
+        fail_at(n, "git: must be an https:// URL") if opts["git"] && !opts["git"].match?(HTTPS)
+      when "webapp"
+        fail_at(n, "web app names cannot contain '/'") if value.include?("/") || value.strip.empty?
+        fail_at(n, "web app URLs must start with https:// or http://") unless args[1].match?(%r{\Ahttps?://\S+\z})
+        fail_at(n, "icon: must be an icon name or https:// URL") if opts["icon"]&.match?(/[\s\/]/) && !opts["icon"].match?(HTTPS)
+      when "plugin"
+        fail_at(n, "plugins must be https:// git URLs") unless value.match?(HTTPS)
+      when "widget", "disable"
+        fail_at(n, "#{verb} takes a built-in widget id such as omarchy.clock") unless value.match?(BUILTIN)
+      end
+      fail_at(n, "bar: must be left, center, or right") if opts["bar"] && !SECTIONS.include?(opts["bar"])
+    end
+
+    def fail_at(n, message)
+      raise Error, "line #{n}: #{message}"
+    end
+  end
+
+  module Writer
+    module_function
+
+    def line(entry)
+      parts = entry.args.map { |a| JSON.generate(a) }
+      entry.opts.each do |key, value|
+        rendered =
+          if key == "settings"
+            "{" + value.map { |k, v| "#{JSON.generate(k)}: #{JSON.generate(v)}" }.join(", ") + "}"
+          else
+            JSON.generate(value)
+          end
+        parts << "#{key}: #{rendered}"
+      end
+      "#{entry.verb} #{parts.join(", ")}"
+    end
+  end
+
+  # ------------------------------------------------------------------ helpers
+
+  # Git URLs compare equal regardless of .git suffix, trailing slash, or case.
+  def self.normalize_repo(url)
+    url.to_s.strip.sub(%r{/+\z}, "").sub(/\.git\z/, "").downcase
+  end
+
+  def self.theme_slug(name)
+    name.to_s.gsub(/<[^>]+>/, "").strip.downcase.tr(" ", "-")
+  end
+
+  # Packages that belong to the machine rather than the person: kernels,
+  # firmware, microcode, drivers, bootloaders, and Omarchy itself.
+  SYSTEM_PACKAGES = [
+    /\Abase(-devel)?\z/, /\Alinux(-lts|-zen|-hardened|-rt)?(-headers)?\z/, /\Alinux-firmware/,
+    /-ucode\z/, /\Amkinitcpio/, /\Aefibootmgr\z/, /\Asudo\z/, /\Agrub\z/, /\Alimine/,
+    /\Asnapper\z/, /\Abtrfs-progs\z/, /\Aomarchy/, /-dkms\z/, /\A(lib32-)?nvidia/,
+    /\Avulkan-/, /\Amesa\z/, /\Aarchinstall\z/, /\Aplymouth/, /-firmware\z/,
+    /\Aiwd\z/, /\Anetworkmanager\z/, /\Awireless-regdb\z/, /\Axf86-video/,
+  ].freeze
+
+  def self.system_package?(name)
+    SYSTEM_PACKAGES.any? { |pattern| name.match?(pattern) }
+  end
+
+  # ------------------------------------------------------------------ machine
+
+  # Everything read from or done to the running system goes through here, so
+  # tests can swap in a fake.
+  class Machine
+    HOME = Dir.home
+    APPS_DIR = File.join(HOME, ".local/share/applications")
+    PLUGINS_DIR = File.join(HOME, ".config/omarchy/plugins")
+    THEMES_DIR = File.join(HOME, ".config/omarchy/themes")
+    SHELL_JSON = File.join(HOME, ".config/omarchy/shell.json")
+
+    def capture(*cmd)
+      out, status = Open3.capture2(*cmd, err: File::NULL)
+      status.success? ? out : ""
+    rescue Errno::ENOENT
+      ""
+    end
+
+    def lines(*cmd) = capture(*cmd).lines.map(&:strip).reject(&:empty?)
+
+    def installed_packages = @installed_packages ||= Set.new(lines("pacman", "-Qq"))
+    def explicit_native = lines("pacman", "-Qqen")
+    def explicit_foreign = lines("pacman", "-Qqem")
+
+    def omarchy_default_packages
+      Dir.glob(File.join(OMARCHY_PATH, "install/*.packages")).flat_map do |file|
+        File.readlines(file, chomp: true).map(&:strip).reject { |l| l.empty? || l.start_with?("#") }
+      end.to_set
+    end
+
+    # Packages Omarchy's own install scripts may add, such as hardware drivers.
+    def omarchy_script_packages
+      words = Set.new
+      add = ->(text) { text.split.each { |w| words << w if w.match?(Parser::PACKAGE) } }
+      Dir.glob(File.join(OMARCHY_PATH, "install/**/*.sh")).each do |file|
+        text = File.read(file).gsub("\\\n", " ")
+        text.scan(/omarchy-pkg-(?:aur-)?add\s+([^\n;&|#]+)/) { |m| add.call(m[0]) }
+        text.scan(/PACKAGES\+?=\(([^)]*)\)/m) { |m| add.call(m[0]) }
+        next unless file.include?("/install/hardware/")
+
+        text.scan(/\[[^\]]+\]=["']?([a-z0-9@._+-]+)/) { |m| words << m[0] }
+      end
+      words
+    end
+
+    def shell_config = read_json(SHELL_JSON) || default_shell_config
+    def default_shell_config = read_json(File.join(OMARCHY_PATH, "config/omarchy/shell.json")) || {}
+
+    # Third-party plugins installed in ~/.config/omarchy/plugins.
+    def plugins
+      Dir.glob(File.join(PLUGINS_DIR, "*")).filter_map do |dir|
+        manifest = read_json(File.join(dir, "manifest.json")) or next
+        remote = capture("git", "-C", dir, "remote", "get-url", "origin").strip
+        { id: manifest["id"].to_s, dir: dir, remote: remote.empty? ? nil : remote }
+      end
+    end
+
+    # Launchers created by `omarchy webapp install`.
+    def webapps
+      Dir.glob(File.join(APPS_DIR, "*.desktop")).filter_map do |file|
+        fields = File.readlines(file, chomp: true).filter_map { |l| l.split("=", 2) if l.include?("=") }.to_h
+        exec = fields["Exec"].to_s
+        next unless (m = exec.match(/\Aomarchy-launch-webapp\s+(?:"((?:[^"\\]|\\.)*)"|(\S+))/))
+
+        url = (m[1] ? m[1].gsub(/\\(.)/, '\1') : m[2]).gsub("%%", "%")
+        { name: fields["Name"].to_s, url: url, icon: fields["Icon"].to_s, file: File.basename(file) }
+      end
+    end
+
+    def webapp_installed?(name) = File.exist?(File.join(APPS_DIR, "#{name}.desktop"))
+    def shipped_launchers = Dir.glob(File.join(OMARCHY_PATH, "applications/*.desktop")).map { |f| File.basename(f) }.to_set
+    def bundled_icon?(name) = !name.empty? && Dir.glob("/usr/share/icons/hicolor/*/apps/#{name}.{png,svg}").any?
+
+    def current_theme = theme_slug(capture("omarchy", "theme", "current").strip)
+    def theme_installed?(slug) = Dir.exist?(File.join(THEMES_DIR, slug)) || Dir.exist?(File.join(OMARCHY_PATH, "themes", slug))
+
+    def theme_remote(slug)
+      dir = File.join(THEMES_DIR, slug)
+      return nil unless Dir.exist?(File.join(dir, ".git"))
+
+      remote = capture("git", "-C", dir, "remote", "get-url", "origin").strip
+      remote.empty? ? nil : remote
+    end
+
+    # repo URL => verification status from the plugin marketplace.
+    def marketplace_status
+      @marketplace_status ||= begin
+        catalog = JSON.parse(capture("curl", "-fsSL", "--compressed", "--max-time", "20", CATALOG_URL))
+        catalog.fetch("plugins", []).to_h { |p| [Omarchyfile.normalize_repo(p["repo"]), p["verificationStatus"].to_s] }
+      rescue JSON::ParserError
+        {}
+      end
+    end
+
+    def run(cmd)
+      puts "  #{Style.dim("$ #{Shellwords.join(cmd)}")}"
+      system(*cmd)
+    end
+
+    def fetch(url)
+      out = capture("curl", "-fsSL", "--max-time", "20", url)
+      raise Error, "could not download #{url}" if out.empty?
+
+      out
+    end
+
+    private
+
+    def read_json(path)
+      JSON.parse(File.read(path))
+    rescue Errno::ENOENT, JSON::ParserError
+      nil
+    end
+
+    def theme_slug(name) = Omarchyfile.theme_slug(name)
+  end
+
+  # Bar layout lookups on a shell.json hash.
+  module Layout
+    module_function
+
+    def entries(config)
+      layout = config.dig("bar", "layout") || {}
+      SECTIONS.flat_map do |section|
+        Array(layout[section]).each_with_index.map { |entry, index| [entry, section, index] }
+      end
+    end
+
+    def find(config, id)
+      entries(config).find { |entry, _, _| entry["id"] == id }
+    end
+
+    def enabled?(config, id)
+      !find(config, id).nil? || Array(config["plugins"]).any? { |p| p["id"] == id }
+    end
+
+    def settings(entry) = entry.reject { |key, _| key == "id" }
+  end
+
+  # ------------------------------------------------------------------ export
+
+  class Exporter
+    Skipped = Struct.new(:what, :reason)
+
+    def initialize(machine)
+      @machine = machine
+      @skipped = []
+    end
+
+    def entries
+      theme + packages + webapps + plugins + widgets
+    end
+
+    def render
+      list = entries
+      out = []
+      out << "# Omarchyfile"
+      out << "# An Omarchy setup in one file. Install it on any Omarchy machine with:"
+      out << "#   omarchyfile install"
+      out << "# Exported #{Time.now.strftime("%Y-%m-%d")} by omarchyfile #{VERSION}."
+      [
+        ["theme", "Theme"],
+        ["pkg", "Packages from the Arch and Omarchy repositories"],
+        ["aur", "Packages from the AUR"],
+        ["webapp", "Web apps"],
+        ["plugin", "Plugins"],
+        [%w[widget disable], "Built-in bar widgets you added, changed, or removed"],
+      ].each do |verbs, title|
+        group = list.select { |e| Array(verbs).include?(e.verb) }
+        next if group.empty?
+
+        out << "" << "# #{title}"
+        group.each { |e| out << Writer.line(e) }
+      end
+      unless @skipped.empty?
+        out << "" << "# Not exported:"
+        @skipped.each { |s| out << "#   #{s.what}: #{s.reason}" }
+      end
+      out.join("\n") + "\n"
+    end
+
+    private
+
+    def theme
+      slug = @machine.current_theme
+      return [] if slug.empty?
+
+      opts = {}
+      remote = @machine.theme_remote(slug)
+      opts["git"] = remote if remote&.match?(Parser::HTTPS)
+      [Entry.new(verb: "theme", args: [slug], opts: opts)]
+    end
+
+    def packages
+      excluded = @machine.omarchy_default_packages | @machine.omarchy_script_packages
+      pick = ->(names) { names.reject { |n| excluded.include?(n) || Omarchyfile.system_package?(n) }.sort }
+      pick.call(@machine.explicit_native).map { |n| Entry.new(verb: "pkg", args: [n], opts: {}) } +
+        pick.call(@machine.explicit_foreign).map { |n| Entry.new(verb: "aur", args: [n], opts: {}) }
+    end
+
+    def webapps
+      shipped = @machine.shipped_launchers
+      @machine.webapps.reject { |w| shipped.include?(w[:file]) }.sort_by { |w| w[:name].downcase }.filter_map do |w|
+        if w[:name].include?("/") || !w[:url].match?(%r{\Ahttps?://\S+\z})
+          @skipped << Skipped.new(w[:name], "unusual name or URL")
+          next
+        end
+        opts = @machine.bundled_icon?(w[:icon]) ? { "icon" => w[:icon] } : {}
+        Entry.new(verb: "webapp", args: [w[:name], w[:url]], opts: opts)
+      end
+    end
+
+    def plugins
+      config = @machine.shell_config
+      @machine.plugins.sort_by { |p| p[:id] }.filter_map do |plugin|
+        next unless Layout.enabled?(config, plugin[:id])
+
+        unless plugin[:remote]&.match?(Parser::HTTPS)
+          @skipped << Skipped.new(plugin[:id], "installed locally, not from an https git URL")
+          next
+        end
+        opts = {}
+        if (found = Layout.find(config, plugin[:id]))
+          entry, section, = found
+          opts["bar"] = section
+          settings = Layout.settings(entry)
+          opts["settings"] = settings unless settings.empty?
+        end
+        Entry.new(verb: "plugin", args: [plugin[:remote].sub(/\.git\z/, "")], opts: opts)
+      end
+    end
+
+    # Built-in widgets differ from Omarchy's default bar: turned off, added, moved, or configured.
+    def widgets
+      mine = @machine.shell_config
+      defaults = @machine.default_shell_config
+      builtin = ->(entry) { entry["id"].to_s.match?(Parser::BUILTIN) }
+      out = []
+      Layout.entries(defaults).each do |entry, _, _|
+        next unless builtin.call(entry)
+
+        out << Entry.new(verb: "disable", args: [entry["id"]], opts: {}) unless Layout.find(mine, entry["id"])
+      end
+      Layout.entries(mine).each do |entry, section, _|
+        unless builtin.call(entry)
+          @skipped << Skipped.new(entry["id"], "custom bar module (runs a local command)") if entry["type"]
+          next
+        end
+        default = Layout.find(defaults, entry["id"])
+        opts = {}
+        opts["bar"] = section if default.nil? || default[1] != section
+        settings = Layout.settings(entry)
+        opts["settings"] = settings if !settings.empty? && (default.nil? || Layout.settings(default[0]) != settings)
+        out << Entry.new(verb: "widget", args: [entry["id"]], opts: opts) if default.nil? || !opts.empty?
+      end
+      out
+    end
+  end
+
+  # ------------------------------------------------------------------ plan
+
+  # One change the file asks for. `run` performs it; `detail` lines describe it.
+  Step = Struct.new(:category, :label, :detail, :run, keyword_init: true)
+
+  class Planner
+    def initialize(entries, machine)
+      @entries = entries
+      @machine = machine
+      @config = machine.shell_config
+    end
+
+    def steps
+      packages + webapps + plugins + bar + theme
+    end
+
+    private
+
+    def of(*verbs) = @entries.select { |e| verbs.include?(e.verb) }
+
+    def packages
+      steps = []
+      { "pkg" => [%w[omarchy pkg add], "Packages"], "aur" => [%w[omarchy pkg aur add], "AUR"] }.each do |verb, (cmd, label)|
+        missing = of(verb).map { |e| e.args[0] }.uniq.reject { |n| @machine.installed_packages.include?(n) }
+        next if missing.empty?
+
+        steps << Step.new(category: "packages", label: label,
+                          detail: ["install #{missing.size}: #{missing.join(" ")}"],
+                          run: -> { @machine.run(cmd + missing) })
+      end
+      steps
+    end
+
+    def webapps
+      of("webapp").reject { |e| @machine.webapp_installed?(e.args[0]) }.map do |e|
+        name, url = e.args
+        Step.new(category: "webapps", label: "Web app", detail: ["add #{name} (#{url})"],
+                 run: -> { @machine.run(["omarchy", "webapp", "install", name, url, e.opts["icon"].to_s]) })
+      end
+    end
+
+    def plugins
+      installed = @machine.plugins.to_h { |p| [Omarchyfile.normalize_repo(p[:remote]), p] }
+      of("plugin").filter_map do |e|
+        url = e.args[0]
+        if (plugin = installed[Omarchyfile.normalize_repo(url)])
+          commands = placement(plugin[:id], e, enabled: Layout.enabled?(@config, plugin[:id]))
+          next if commands.empty?
+
+          Step.new(category: "plugins", label: "Plugin", detail: describe(plugin[:id], commands),
+                   run: -> { commands.all? { |c| @machine.run(c) } })
+        else
+          status = @machine.marketplace_status[Omarchyfile.normalize_repo(url)]
+          trust = status ? "on plugins.omarchy.org, #{status}" : "not on plugins.omarchy.org"
+          detail = ["add #{url} (#{trust})"]
+          detail << "then place it on the #{e.opts["bar"]}" if e.opts["bar"]
+          detail << "then apply #{e.opts["settings"].size} setting#{"s" if e.opts["settings"].size > 1}" if e.opts["settings"]
+          Step.new(category: "plugins", label: "Plugin", detail: detail, run: -> { add_plugin(url, e) })
+        end
+      end
+    end
+
+    def bar
+      steps = of("disable").filter_map do |e|
+        id = e.args[0]
+        next unless Layout.find(@config, id)
+
+        Step.new(category: "bar", label: "Bar", detail: ["turn off #{id}"],
+                 run: -> { @machine.run(["omarchy", "plugin", "disable", id]) })
+      end
+      steps + of("widget").filter_map do |e|
+        id = e.args[0]
+        commands = placement(id, e, enabled: !Layout.find(@config, id).nil?)
+        next if commands.empty?
+
+        Step.new(category: "bar", label: "Bar", detail: describe(id, commands),
+                 run: -> { commands.all? { |c| @machine.run(c) } })
+      end
+    end
+
+    def theme
+      entry = of("theme").last or return []
+      slug = Omarchyfile.theme_slug(entry.args[0])
+      return [] if @machine.current_theme == slug
+
+      detail = ["switch to #{slug}"]
+      commands = []
+      if entry.opts["git"] && !@machine.theme_installed?(slug)
+        detail.unshift("install from #{entry.opts["git"]}")
+        commands << ["omarchy", "theme", "install", entry.opts["git"]]
+      end
+      commands << ["omarchy", "theme", "set", slug]
+      [Step.new(category: "theme", label: "Theme", detail: detail, run: -> { commands.all? { |c| @machine.run(c) } })]
+    end
+
+    # Commands that enable a widget and bring its section and settings in line.
+    def placement(id, entry, enabled:)
+      section = entry.opts["bar"]
+      commands = []
+      if enabled
+        found = Layout.find(@config, id)
+        commands << ["omarchy", "bar", "move", id, "--section", section] if section && found && found[1] != section
+        current = found ? Layout.settings(found[0]) : {}
+      else
+        commands << ["omarchy", "plugin", "enable", id, *(section ? ["--section", section] : [])]
+        current = {}
+      end
+      (entry.opts["settings"] || {}).each do |key, value|
+        next if current[key] == value
+
+        commands << ["omarchy", "bar", "set", id, key, JSON.generate(value), "--json"]
+      end
+      commands
+    end
+
+    def describe(id, commands)
+      commands.map do |cmd|
+        case cmd[1..2]
+        when %w[plugin enable] then "turn on #{id}#{" on the #{cmd[5]}" if cmd[5]}"
+        when %w[bar move] then "move #{id} to the #{cmd[5]}"
+        when %w[bar set] then "set #{id} #{cmd[4]} to #{cmd[5]}"
+        else cmd.join(" ")
+        end
+      end
+    end
+
+    def add_plugin(url, entry)
+      return false unless @machine.run(["omarchy", "plugin", "add", url, "--enable", "--yes"])
+
+      plugin = @machine.plugins.find { |p| Omarchyfile.normalize_repo(p[:remote]) == Omarchyfile.normalize_repo(url) }
+      return true unless plugin
+
+      @config = @machine.shell_config
+      commands = placement(plugin[:id], entry, enabled: Layout.enabled?(@config, plugin[:id]))
+      commands.all? { |c| @machine.run(c) }
+    end
+  end
+
+  # ------------------------------------------------------------------ output
+
+  module Style
+    module_function
+
+    def tty? = $stdout.tty?
+    def bold(s) = tty? ? "\e[1m#{s}\e[0m" : s
+    def dim(s) = tty? ? "\e[2m#{s}\e[0m" : s
+    def warn(s) = tty? ? "\e[33m#{s}\e[0m" : s
+  end
+
+  def self.print_plan(steps, source)
+    puts Style.bold("omarchyfile") + Style.dim(" · #{source}")
+    puts
+    if steps.empty?
+      puts "  Everything in this Omarchyfile is already on this machine."
+      return
+    end
+    steps.each do |step|
+      step.detail.each_with_index do |line, i|
+        label = i.zero? ? step.label : ""
+        puts "  #{Style.bold(label.ljust(10))} #{line}"
+      end
+    end
+    if steps.any? { |s| s.category == "plugins" && s.detail.first.start_with?("add ") }
+      puts
+      puts "  " + Style.warn("Plugins run as unsandboxed code in your desktop shell. Only add plugins you trust.")
+    end
+  end
+
+  # ------------------------------------------------------------------ CLI
+
+  module CLI
+    USAGE = <<~TEXT
+      Usage: omarchyfile <command> [options]
+
+      Commands:
+        export [PATH]           Write this machine's setup to an Omarchyfile (default ./Omarchyfile)
+        check [PATH|URL]        Show what install would change, without changing anything
+        install [PATH|URL]      Make this machine match an Omarchyfile
+
+      Options:
+        --only LIST             Limit to categories: theme,packages,webapps,plugins,bar
+        --yes                   Install without asking for confirmation
+        --stdout                Export to standard output instead of a file
+        --force                 Overwrite an existing file on export
+        --version               Show the version
+    TEXT
+
+    module_function
+
+    def run(argv, machine: Machine.new)
+      options = { only: nil, yes: false, stdout: false, force: false }
+      parser = OptionParser.new do |o|
+        o.on("--only LIST") { |v| options[:only] = v.split(",").map(&:strip) }
+        o.on("--yes") { options[:yes] = true }
+        o.on("--stdout") { options[:stdout] = true }
+        o.on("--force") { options[:force] = true }
+        o.on("--version") { puts "omarchyfile #{VERSION}"; return 0 }
+        o.on("-h", "--help") { puts USAGE; return 0 }
+      end
+      args = parser.parse(argv)
+      command = args.shift
+      unknown = Array(options[:only]) - CATEGORIES.values.uniq
+      raise Error, "unknown category #{unknown.join(", ")} (use #{CATEGORIES.values.uniq.join(", ")})" unless unknown.empty?
+
+      case command
+      when "export" then export(args.first || "Omarchyfile", options, machine)
+      when "check" then check(args.first || "Omarchyfile", options, machine)
+      when "install" then install(args.first || "Omarchyfile", options, machine)
+      else
+        puts USAGE
+        command ? 2 : 0
+      end
+    rescue Error, OptionParser::ParseError => e
+      warn "omarchyfile: #{e.message}"
+      2
+    end
+
+    def export(path, options, machine)
+      text = Exporter.new(machine).render
+      if options[:stdout]
+        print text
+        return 0
+      end
+      raise Error, "#{path} already exists (use --force to overwrite)" if File.exist?(path) && !options[:force]
+
+      File.write(path, text)
+      puts "Wrote #{path}. Install it anywhere with: omarchyfile install #{path}"
+      0
+    end
+
+    def load(source, machine)
+      text =
+        if source.match?(%r{\Ahttps?://})
+          machine.fetch(raw_url(source))
+        elsif File.exist?(source)
+          File.read(source)
+        else
+          raise Error, "no Omarchyfile at #{source}. Run 'omarchyfile export' to create one, or pass a path or URL."
+        end
+      Parser.parse(text)
+    end
+
+    # GitHub and gist page URLs point at HTML; use the raw file instead.
+    def raw_url(url)
+      url
+        .sub(%r{\Ahttps://github\.com/([^/]+)/([^/]+)/blob/}, 'https://raw.githubusercontent.com/\1/\2/')
+        .sub(%r{\Ahttps://gist\.github\.com/([^/]+)/([0-9a-f]+)/?\z}, 'https://gist.githubusercontent.com/\1/\2/raw')
+    end
+
+    def plan(source, options, machine)
+      entries = load(source, machine)
+      entries = entries.select { |e| options[:only].include?(e.category) } if options[:only]
+      Planner.new(entries, machine).steps
+    end
+
+    def check(source, options, machine)
+      steps = plan(source, options, machine)
+      Omarchyfile.print_plan(steps, source)
+      steps.empty? ? 0 : 1
+    end
+
+    def install(source, options, machine)
+      steps = plan(source, options, machine)
+      Omarchyfile.print_plan(steps, source)
+      return 0 if steps.empty?
+
+      puts
+      unless options[:yes]
+        raise Error, "not a terminal; pass --yes to install without confirmation" unless $stdin.tty?
+
+        print "Apply #{steps.size} change#{"s" if steps.size > 1}? [y/N] "
+        return 1 unless $stdin.gets.to_s.strip.match?(/\Ay(es)?\z/i)
+      end
+      failed = steps.reject do |step|
+        puts
+        puts Style.bold("#{step.label}: #{step.detail.first}")
+        step.run.call
+      end
+      puts
+      if failed.empty?
+        puts "Done. This machine now matches #{source}."
+        0
+      else
+        puts Style.warn("#{failed.size} change#{"s" if failed.size > 1} failed:")
+        failed.each { |s| puts "  #{s.label}: #{s.detail.first}" }
+        1
+      end
+    end
+  end
+end
+
+exit Omarchyfile::CLI.run(ARGV) if $PROGRAM_NAME == __FILE__
