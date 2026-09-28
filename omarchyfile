@@ -174,6 +174,20 @@ module Omarchyfile
 
   # ------------------------------------------------------------------ helpers
 
+  # How an entry reads in the export checklist.
+  def self.label(entry)
+    value = entry.args[0]
+    case entry.verb
+    when "theme" then "Theme     #{value}"
+    when "pkg" then "Package   #{value}"
+    when "aur" then "AUR       #{value}"
+    when "webapp" then "Web app   #{value} (#{entry.args[1]})"
+    when "plugin" then "Plugin    #{value.sub(%r{\Ahttps://github\.com/}, "")}#{" on the #{entry.opts["bar"]}" if entry.opts["bar"]}"
+    when "widget" then "Bar       #{value}#{" on the #{entry.opts["bar"]}" if entry.opts["bar"]}#{" with settings" if entry.opts["settings"]}"
+    when "disable" then "Bar       turn off #{value}"
+    end
+  end
+
   # Git URLs compare equal regardless of .git suffix, trailing slash, or case.
   def self.normalize_repo(url)
     url.to_s.strip.sub(%r{/+\z}, "").sub(/\.git\z/, "").downcase
@@ -296,6 +310,20 @@ module Omarchyfile
       system(*cmd)
     end
 
+    # Checklist with everything ticked; returns the labels left ticked, or nil if cancelled.
+    def pick(labels)
+      raise Error, "--pick needs an interactive terminal" unless $stdin.tty?
+
+      out, status = Open3.capture2(
+        "gum", "choose", "--no-limit", "--selected=*", "--height", [labels.size, 25].min.to_s,
+        "--header", "Press x to untick what to leave out, enter to save",
+        stdin_data: labels.join("\n")
+      )
+      status.success? ? out.lines.map(&:chomp) : nil
+    rescue Errno::ENOENT
+      raise Error, "--pick needs gum, which ships with Omarchy"
+    end
+
     def fetch(url)
       out = capture("curl", "-fsSL", "--max-time", "20", url)
       raise Error, "could not download #{url}" if out.empty?
@@ -350,8 +378,7 @@ module Omarchyfile
       theme + packages + webapps + plugins + widgets
     end
 
-    def render
-      list = entries
+    def render(list = entries)
       out = []
       out << "# Omarchyfile"
       out << "# An Omarchy setup in one file. Install it on any Omarchy machine with:"
@@ -640,18 +667,20 @@ module Omarchyfile
         --yes                   Install without asking for confirmation
         --stdout                Export to standard output instead of a file
         --force                 Overwrite an existing file on export
+        --pick                  Choose what to export from a checklist
         --version               Show the version
     TEXT
 
     module_function
 
     def run(argv, machine: Machine.new)
-      options = { only: nil, yes: false, stdout: false, force: false }
+      options = { only: nil, yes: false, stdout: false, force: false, pick: false }
       parser = OptionParser.new do |o|
         o.on("--only LIST") { |v| options[:only] = v.split(",").map(&:strip) }
         o.on("--yes") { options[:yes] = true }
         o.on("--stdout") { options[:stdout] = true }
         o.on("--force") { options[:force] = true }
+        o.on("--pick") { options[:pick] = true }
         o.on("--version") { puts "omarchyfile #{VERSION}"; return 0 }
         o.on("-h", "--help") { puts USAGE; return 0 }
       end
@@ -674,7 +703,13 @@ module Omarchyfile
     end
 
     def export(path, options, machine)
-      text = Exporter.new(machine).render
+      exporter = Exporter.new(machine)
+      entries = exporter.entries
+      if options[:pick]
+        chosen = machine.pick(entries.map { |e| Omarchyfile.label(e) }) or raise Error, "export cancelled"
+        entries = entries.select { |e| chosen.include?(Omarchyfile.label(e)) }
+      end
+      text = exporter.render(entries)
       if options[:stdout]
         print text
         return 0

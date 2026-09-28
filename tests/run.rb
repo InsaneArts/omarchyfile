@@ -68,6 +68,7 @@ class FakeMachine < Omarchyfile::Machine
   def theme_installed?(slug) = @d[:themes].include?(slug)
   def theme_remote(slug) = @d[:theme_remotes][slug]
   def marketplace_status = @d[:marketplace]
+  def pick(labels) = @d[:pick]&.call(labels)
 
   def run(cmd)
     @ran << cmd
@@ -241,6 +242,34 @@ test "a machine matches its own export" do
   entries = P.parse(Omarchyfile::Exporter.new(machine).render)
   steps = Omarchyfile::Planner.new(entries, machine).steps
   eq steps.map(&:detail), []
+end
+
+test "export --pick writes only the ticked entries" do
+  machine = rich_machine
+  machine.instance_variable_get(:@d)[:pick] = ->(labels) { labels.reject { |l| l.start_with?("AUR") || l.include?("Linear") } }
+  out = StringIO.new
+  orig = $stdout
+  $stdout = out
+  code = Omarchyfile::CLI.run(["export", "--pick", "--stdout"], machine: machine)
+  $stdout = orig
+  eq code, 0
+  text = out.string
+  raise "kept package missing" unless text.include?(%(pkg "btop"))
+  raise "unticked AUR package exported" if text.include?(%(aur "zen-browser-bin"))
+  raise "unticked web app exported" if text.include?("Linear")
+  raise "Not exported notes missing" unless text.include?("# Not exported:")
+end
+
+test "cancelling the checklist writes nothing" do
+  machine = rich_machine
+  machine.instance_variable_get(:@d)[:pick] = ->(_labels) { nil }
+  eq quietly { Omarchyfile::CLI.run(["export", "--pick", "--stdout"], machine: machine) }, 2
+end
+
+test "checklist labels read naturally" do
+  entries = P.parse(%(pkg "btop"\nplugin "#{SPACES}", bar: "left"\ndisable "omarchy.workspaces"\n))
+  eq entries.map { |e| Omarchyfile.label(e) },
+     ["Package   btop", "Plugin    tornikegomareli/omarchy-spaces on the left", "Bar       turn off omarchy.workspaces"]
 end
 
 # ---------------------------------------------------------------- plan
