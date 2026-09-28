@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0
+
+- Keybindings: export your `o.bind` and `hl.unbind` lines, and install them
+  into a marked block in `bindings.lua`. Keys you bound yourself are never
+  overridden, missing programs are skipped, Omarchy defaults are unbound
+  when replaced, and Hyprland errors restore the file.
+- `omarchyfile share` publishes an Omarchyfile as a secret gist and prints
+  its install command. Sharing again updates the same link.
+- `omarchyfile sync` keeps machines in step through a git repository.
+- `omarchyfile export --pick` chooses what to export from a checklist.
+
 ## 0.1.0
 
 First release.
