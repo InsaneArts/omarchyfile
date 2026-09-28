@@ -2,7 +2,16 @@
 
 <h3 align="center">Your Omarchy setup in one file.</h3>
 
-Omarchyfile writes your apps, web apps, plugins, bar layout, and theme to a single file. Install that file on a fresh machine, or share it, and one command sets everything up.
+You don't write an Omarchyfile. Omarchyfile writes it from your machine: your apps, web apps, plugins, bar layout, and theme. Install it on a fresh machine, or share it, and one command sets everything up.
+
+## Make one
+
+```sh
+omarchyfile export          # write ./Omarchyfile from this machine
+omarchyfile export --pick   # untick anything you'd rather not share first
+```
+
+The result reads like this:
 
 ```ruby
 # Omarchyfile
@@ -20,7 +29,22 @@ disable "omarchy.workspaces"
 widget "omarchy.tailscale", bar: "right"
 ```
 
-## Install
+## Install it anywhere
+
+```sh
+omarchyfile check Omarchyfile     # see what would change, without changing anything
+omarchyfile install Omarchyfile   # make this machine match
+```
+
+Both take a path or a URL, including GitHub and gist links:
+
+```sh
+omarchyfile install https://github.com/alice/dotfiles/blob/main/Omarchyfile
+```
+
+`install` lists every change and asks first. Running it twice changes nothing the second time.
+
+## Get Omarchyfile
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/InsaneArts/omarchyfile/main/omarchyfile -o ~/.local/bin/omarchyfile
@@ -29,27 +53,12 @@ chmod +x ~/.local/bin/omarchyfile
 
 It needs only Ruby, which ships with Omarchy.
 
-## Use
+## Options
 
-```sh
-omarchyfile export     # write ./Omarchyfile from this machine
-omarchyfile check      # show what install would change, without changing anything
-omarchyfile install    # make this machine match ./Omarchyfile
-```
-
-`check` and `install` also take a path or a URL, including GitHub and gist links:
-
-```sh
-omarchyfile install https://github.com/alice/dotfiles/blob/main/Omarchyfile
-```
-
-Options:
-
+- `--pick` chooses what to export from a checklist.
 - `--only packages,webapps,plugins,bar,theme` applies part of a file.
 - `--yes` installs without asking, for scripts.
 - `--stdout` prints an export instead of writing a file.
-
-Running `install` twice changes nothing the second time.
 
 ## What an export leaves out
 
