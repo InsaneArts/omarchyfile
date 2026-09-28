@@ -1,0 +1,16 @@
+pkgbase = omarchyfile
+	pkgdesc = Your Omarchy setup in one file: export, share, sync, and install it
+	pkgver = 0.2.0
+	pkgrel = 1
+	url = https://github.com/InsaneArts/omarchyfile
+	arch = any
+	license = MIT
+	depends = ruby
+	depends = curl
+	depends = git
+	optdepends = github-cli: share setups as gists
+	optdepends = gum: choose what to export with --pick
+	source = omarchyfile-0.2.0.tar.gz::https://github.com/InsaneArts/omarchyfile/archive/refs/tags/v0.2.0.tar.gz
+	sha256sums = 3151519d6bbfd12316e69276605cbb63546b1983da75bf82997c1e5b4b79159b
+
+pkgname = omarchyfile

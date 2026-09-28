@@ -1,0 +1,26 @@
+# Maintainer: Tornike Gomareli <gomarelidevelopment@gmail.com>
+
+pkgname=omarchyfile
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Your Omarchy setup in one file: export, share, sync, and install it"
+arch=('any')
+url="https://github.com/InsaneArts/omarchyfile"
+license=('MIT')
+depends=('ruby' 'curl' 'git')
+optdepends=('github-cli: share setups as gists'
+            'gum: choose what to export with --pick')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('3151519d6bbfd12316e69276605cbb63546b1983da75bf82997c1e5b4b79159b')
+
+check() {
+  cd "$pkgname-$pkgver"
+  ruby tests/run.rb
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 omarchyfile "$pkgdir/usr/bin/omarchyfile"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
