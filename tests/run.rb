@@ -47,6 +47,8 @@ class FakeMachine < Omarchyfile::Machine
       installed: [], native: [], foreign: [], defaults: [], script: [], config: { "bar" => { "layout" => {} } },
       default_config: { "bar" => { "layout" => {} } }, plugins: [], webapps: [], shipped: [], icons: [],
       theme: "solitude", theme_remotes: {}, themes: ["solitude"], marketplace: {},
+      home: "/home/me", bindings: "", default_bindings: {}, commands: [], shares: {}, gists: {},
+      git_root: nil, upstream: false, confirm: true,
     }.merge(data)
     @config = @d[:config]
     @ran = []
@@ -69,6 +71,25 @@ class FakeMachine < Omarchyfile::Machine
   def theme_remote(slug) = @d[:theme_remotes][slug]
   def marketplace_status = @d[:marketplace]
   def pick(labels) = @d[:pick]&.call(labels)
+  def home = @d[:home]
+  def bindings_text = @d[:bindings]
+  def default_bindings = @d[:default_bindings]
+  def command_available?(command) = @d[:commands].include?(Omarchyfile.program(command).sub(%r{\A~/}, "#{home}/"))
+  def confirm?(_question) = @d[:confirm]
+  def shares = @d[:shares]
+  def save_shares(map) = @d[:shares] = map
+  def gist_create(text, public:) = "https://gist.github.com/me/#{(@d[:gists].size + 1).to_s * 6}".tap { |u| @d[:gists][u] = [text, public] }
+  def gist_update(url, text) = @d[:gists].key?(url) && (@d[:gists][url][0] = text; true)
+  def gists = @d[:gists]
+  def git_root(_path) = @d[:git_root]
+  def git_upstream?(_repo) = @d[:upstream]
+  def hostname = "desk"
+
+  def add_bindings(lines)
+    @ran << [:bindings, lines]
+    @d[:bindings] = Omarchyfile::Bindings.insert(@d[:bindings], lines)
+    true
+  end
 
   def run(cmd)
     @ran << cmd
@@ -360,6 +381,109 @@ end
 
 test "rejects unknown --only categories" do
   eq quietly { Omarchyfile::CLI.run(["check", "--only", "fonts"], machine: FakeMachine.new) }, 2
+end
+
+# ---------------------------------------------------------------- keybindings
+
+USER_BINDINGS = <<~LUA
+  -- Keep only your personal keybinding overrides here.
+  -- o.bind("SUPER + SHIFT + R", "SSH", "alacritty -e ssh your-server")
+  hl.unbind("SUPER + RETURN")
+  o.bind("SUPER + RETURN", "Jolt", "/home/me/Development/jolt/target/release/jolt toggle")
+  o.bind("SUPER + CTRL + ALT + S", nil, "omarchy-shell tornikegomareli.spaces toggle") -- spaces
+  o.bind("SUPER + P", "Say \\"hi\\"", "notify-send \\"hi\\"")
+  o.bind("SUPER + T", "Terminal", { omarchy = "terminal" })
+LUA
+
+test "normalizes key combinations" do
+  eq Omarchyfile::Keys.normalize("ctrl+super + s"), "SUPER + CTRL + S"
+  eq Omarchyfile::Keys.normalize("SUPER + SHIFT + CTRL + ALT + k"), "SUPER + CTRL + ALT + SHIFT + K"
+  eq Omarchyfile::Keys.normalize("super + mouse:272"), "SUPER + MOUSE:272"
+end
+
+test "finds the program a command starts" do
+  eq Omarchyfile.program("uwsm-app -- zellij attach"), "zellij"
+  eq Omarchyfile.program("FOO=1 BAR=2 ~/bin/tool --x"), "~/bin/tool"
+  eq Omarchyfile.program(%(notify-send "a b")), "notify-send"
+end
+
+test "reads plain bindings and notes Lua ones" do
+  found, others = Omarchyfile::Bindings.parse(USER_BINDINGS)
+  eq found.map { |b| [b[:kind], b[:keys]] }, [[:unbind, "SUPER + RETURN"], [:bind, "SUPER + RETURN"],
+                                             [:bind, "SUPER + CTRL + ALT + S"], [:bind, "SUPER + P"]]
+  eq found[2][:desc], nil
+  eq found[3][:desc], 'Say "hi"'
+  eq found[3][:command], 'notify-send "hi"'
+  eq others, ["SUPER + T"]
+end
+
+test "writes Lua lines that read back the same" do
+  entries = P.parse(%(bind "SUPER + P", "notify-send \\"hi\\" \\\\ ok", desc: "Say \\"hi\\""\nunbind "SUPER + SPACE"\n))
+  lines = entries.map { |e| Omarchyfile::Bindings.line(e) }
+  found, = Omarchyfile::Bindings.parse(lines.join("\n"))
+  eq found[0][:command], 'notify-send "hi" \\ ok'
+  eq found[0][:desc], 'Say "hi"'
+  eq found[1], { kind: :unbind, keys: "SUPER + SPACE" }
+end
+
+test "inserts into one marked block and reuses it" do
+  once = Omarchyfile::Bindings.insert("-- mine\n", ['hl.unbind("A")'])
+  twice = Omarchyfile::Bindings.insert(once, ['o.bind("B", nil, "b")'])
+  eq twice.scan(Omarchyfile::Bindings::BEGIN_MARK).size, 1
+  raise "order wrong:\n#{twice}" unless twice.index('hl.unbind("A")') < twice.index('o.bind("B"') &&
+                                      twice.index('o.bind("B"') < twice.index(Omarchyfile::Bindings::END_MARK)
+  raise "user text lost" unless twice.start_with?("-- mine\n")
+end
+
+test "exports plain bindings with home paths made portable" do
+  m = FakeMachine.new(bindings: USER_BINDINGS)
+  text = Omarchyfile::Exporter.new(m).render
+  raise "unbind missing" unless text.include?(%(unbind "SUPER + RETURN"\n))
+  raise "home not rewritten:\n#{text}" unless text.include?(%(bind "SUPER + RETURN", "~/Development/jolt/target/release/jolt toggle", desc: "Jolt"))
+  raise "nil desc wrong" unless text.include?(%(bind "SUPER + CTRL + ALT + S", "omarchy-shell tornikegomareli.spaces toggle"\n))
+  raise "Lua binding not noted" unless text.include?("SUPER + T: keybinding runs Lua")
+  raise "unbind must come before its bind" unless text.index('unbind "SUPER + RETURN"') < text.index('bind "SUPER + RETURN"')
+end
+
+test "a machine with bindings matches its own export" do
+  m = FakeMachine.new(bindings: USER_BINDINGS)
+  steps = Omarchyfile::Planner.new(P.parse(Omarchyfile::Exporter.new(m).render), m).steps
+  eq steps.map(&:detail), []
+end
+
+test "adds a binding, replacing an Omarchy default with an unbind" do
+  m = FakeMachine.new(commands: %w[zellij], default_bindings: { "SUPER + RETURN" => "Terminal" })
+  steps = Omarchyfile::Planner.new(P.parse(%(bind "SUPER + RETURN", "uwsm-app -- zellij", desc: "Zellij"\n)), m).steps
+  eq steps.first.detail, ['SUPER + RETURN replaces Omarchy\'s "Terminal"', "SUPER + RETURN runs uwsm-app -- zellij (Zellij)"]
+  steps.first.run.call
+  eq m.ran, [[:bindings, ['hl.unbind("SUPER + RETURN")', 'o.bind("SUPER + RETURN", "Zellij", "uwsm-app -- zellij")']]]
+end
+
+test "never overrides the user's own binding and skips missing programs" do
+  m = FakeMachine.new(bindings: %(o.bind("SUPER + J", "Mine", "foot")\n), commands: %w[foot])
+  file = %(bind "SUPER + J", "kitty"\nbind "SUPER + K", "~/bin/jolt toggle"\nbind "SUPER + L", "foot -e btop"\n)
+  steps = Omarchyfile::Planner.new(P.parse(file), m).steps
+  eq steps.reject(&:info).map(&:detail), [["SUPER + L runs foot -e btop"]]
+  eq steps.select(&:info).map(&:detail), [["skip SUPER + J: you already bound it to foot", "skip SUPER + K: jolt is not installed here"]]
+end
+
+test "counts a program the same file installs as available" do
+  m = FakeMachine.new
+  steps = Omarchyfile::Planner.new(P.parse(%(pkg "zellij"\nbind "SUPER + Z", "zellij"\n)), m).steps
+  eq steps.map(&:label), %w[Packages Keys]
+end
+
+test "skipped bindings alone do not count as changes" do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "Omarchyfile")
+    File.write(path, %(bind "SUPER + K", "~/bin/missing"\n))
+    eq quietly { Omarchyfile::CLI.run(["check", path], machine: FakeMachine.new) }, 0
+  end
+end
+
+test "rejects bindings that are not key combinations" do
+  raises(/not a key combination/) { P.parse(%(bind "SUPER + ;", "x")) }
+  raises(/needs a command/) { P.parse(%(bind "SUPER + X", "   ")) }
 end
 
 if $failed.positive?

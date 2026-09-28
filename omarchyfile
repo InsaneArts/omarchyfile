@@ -1,10 +1,11 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# omarchyfile: describe an Omarchy setup in one file, then export, check, or
-# install it. The file is parsed, never executed, so a shared Omarchyfile can
-# only name things to install. It cannot run code of its own.
+# omarchyfile: describe an Omarchy setup in one file, then export, check,
+# or install it. The file is parsed, never executed, so a shared
+# Omarchyfile can only name things to install. It cannot run code of its own.
 
+require "fileutils"
 require "json"
 require "open3"
 require "optparse"
@@ -26,6 +27,7 @@ module Omarchyfile
     "webapp" => "webapps",
     "plugin" => "plugins",
     "widget" => "bar", "disable" => "bar",
+    "bind" => "keybindings", "unbind" => "keybindings",
   }.freeze
 
   Entry = Struct.new(:verb, :args, :opts, :line, keyword_init: true) do
@@ -49,11 +51,15 @@ module Omarchyfile
       "plugin" => [1, %w[bar settings]],
       "widget" => [1, %w[bar settings]],
       "disable" => [1, []],
+      "bind" => [2, %w[desc]],
+      "unbind" => [1, []],
     }.freeze
     STRING = /"(?:[^"\\]|\\.)*"/
     PACKAGE = /\A[a-z0-9@_+][a-z0-9@._+-]*\z/
     HTTPS = %r{\Ahttps://[^\s"'`$\\]+\z}
     BUILTIN = /\Aomarchy\.[a-z0-9][a-z0-9-]*\z/
+    KEYS = /\A[A-Za-z0-9_:]+(?:\s*\+\s*[A-Za-z0-9_:]+)*\z/
+    PLAIN = /\A[^[:cntrl:]]+\z/
 
     module_function
 
@@ -145,6 +151,10 @@ module Omarchyfile
         fail_at(n, "plugins must be https:// git URLs") unless value.match?(HTTPS)
       when "widget", "disable"
         fail_at(n, "#{verb} takes a built-in widget id such as omarchy.clock") unless value.match?(BUILTIN)
+      when "bind", "unbind"
+        fail_at(n, "'#{value}' is not a key combination such as \"SUPER + SHIFT + R\"") unless value.match?(KEYS)
+        fail_at(n, "bind needs a command to run") if verb == "bind" && !(args[1].match?(PLAIN) && !args[1].strip.empty?)
+        fail_at(n, "desc: cannot contain control characters") if opts["desc"] && !opts["desc"].match?(PLAIN)
       end
       fail_at(n, "bar: must be left, center, or right") if opts["bar"] && !SECTIONS.include?(opts["bar"])
     end
@@ -172,6 +182,76 @@ module Omarchyfile
     end
   end
 
+  # ------------------------------------------------------------------ keybindings
+
+  module Keys
+    MODIFIERS = { "SUPER" => "SUPER", "WIN" => "SUPER", "MOD4" => "SUPER", "META" => "SUPER",
+                  "CTRL" => "CTRL", "CONTROL" => "CTRL", "ALT" => "ALT", "MOD1" => "ALT", "SHIFT" => "SHIFT" }.freeze
+    ORDER = %w[SUPER CTRL ALT SHIFT].freeze
+
+    module_function
+
+    # "ctrl+super + s" and "SUPER + CTRL + S" name the same key.
+    def normalize(keys)
+      parts = keys.split("+").map { |p| p.strip.upcase }.reject(&:empty?)
+      mods, rest = parts.partition { |p| MODIFIERS.key?(p) }
+      (mods.map { |m| MODIFIERS[m] }.uniq.sort_by { |m| ORDER.index(m) } + rest).join(" + ")
+    end
+  end
+
+  # Reads and writes the plain forms of ~/.config/hypr/bindings.lua:
+  #   o.bind("KEYS", "Description" | nil, "command")
+  #   hl.unbind("KEYS")
+  module Bindings
+    STR = /"((?:[^"\\]|\\.)*)"/
+    BIND = /\A\s*o\.bind\(\s*#{STR}\s*,\s*(?:#{STR}|nil)\s*,\s*#{STR}\s*\)\s*(?:--.*)?\z/
+    UNBIND = /\A\s*hl\.unbind\(\s*#{STR}\s*\)\s*(?:--.*)?\z/
+    OTHER = /\A\s*(?:o\.bind|o\.bind_toggle|hl\.bind)\(\s*#{STR}/
+    BEGIN_MARK = "-- >>> omarchyfile >>>"
+    END_MARK = "-- <<< omarchyfile <<<"
+
+    module_function
+
+    # Returns [bindings, keys of bindings that run Lua instead of a command].
+    def parse(text)
+      found = []
+      others = []
+      text.each_line do |raw|
+        line = raw.chomp
+        next if line.strip.start_with?("--")
+
+        if (m = line.match(BIND))
+          found << { kind: :bind, keys: unescape(m[1]), desc: m[2] && unescape(m[2]), command: unescape(m[3]) }
+        elsif (m = line.match(UNBIND))
+          found << { kind: :unbind, keys: unescape(m[1]) }
+        elsif (m = line.match(OTHER))
+          others << unescape(m[1])
+        end
+      end
+      [found, others]
+    end
+
+    def line(entry)
+      keys = %("#{escape(entry.args[0])}")
+      return "hl.unbind(#{keys})" if entry.verb == "unbind"
+
+      desc = entry.opts["desc"] ? %("#{escape(entry.opts["desc"])}") : "nil"
+      %(o.bind(#{keys}, #{desc}, "#{escape(entry.args[1])}"))
+    end
+
+    # Adds lines inside the omarchyfile block, creating it at the end if needed.
+    def insert(text, lines)
+      block = lines.join("\n")
+      return text.sub(END_MARK) { "#{block}\n#{END_MARK}" } if text.include?(END_MARK)
+
+      base = text.empty? || text.end_with?("\n") ? text : "#{text}\n"
+      "#{base}\n#{BEGIN_MARK}\n-- Added by omarchyfile install. Edit freely.\n#{block}\n#{END_MARK}\n"
+    end
+
+    def unescape(s) = s.gsub(/\\(.)/) { { "n" => "\n", "t" => "\t" }.fetch(Regexp.last_match(1), Regexp.last_match(1)) }
+    def escape(s) = s.gsub("\\") { "\\\\" }.gsub('"') { "\\\"" }
+  end
+
   # ------------------------------------------------------------------ helpers
 
   # How an entry reads in the export checklist.
@@ -185,6 +265,8 @@ module Omarchyfile
     when "plugin" then "Plugin    #{value.sub(%r{\Ahttps://github\.com/}, "")}#{" on the #{entry.opts["bar"]}" if entry.opts["bar"]}"
     when "widget" then "Bar       #{value}#{" on the #{entry.opts["bar"]}" if entry.opts["bar"]}#{" with settings" if entry.opts["settings"]}"
     when "disable" then "Bar       turn off #{value}"
+    when "bind" then "Key       #{value} runs #{entry.args[1]}"
+    when "unbind" then "Key       turn off #{value}"
     end
   end
 
@@ -195,6 +277,22 @@ module Omarchyfile
 
   def self.theme_slug(name)
     name.to_s.gsub(/<[^>]+>/, "").strip.downcase.tr(" ", "-")
+  end
+
+  # The program a command line starts, looking past env assignments and
+  # launchers such as `uwsm-app --`.
+  def self.program(command)
+    words = begin
+      Shellwords.split(command)
+    rescue ArgumentError
+      command.split
+    end
+    words = words.drop_while { |w| w.match?(/\A\w+=/) }
+    while %w[uwsm-app setsid env nohup exec].include?(words.first)
+      words.shift
+      words.shift if words.first == "--"
+    end
+    words.first.to_s
   end
 
   # Packages that belong to the machine rather than the person: kernels,
@@ -221,6 +319,10 @@ module Omarchyfile
     PLUGINS_DIR = File.join(HOME, ".config/omarchy/plugins")
     THEMES_DIR = File.join(HOME, ".config/omarchy/themes")
     SHELL_JSON = File.join(HOME, ".config/omarchy/shell.json")
+    BINDINGS_FILE = File.join(HOME, ".config/hypr/bindings.lua")
+    STATE_DIR = File.join(ENV.fetch("XDG_STATE_HOME", File.join(HOME, ".local/state")), "omarchyfile")
+
+    def home = HOME
 
     def capture(*cmd)
       out, status = Open3.capture2(*cmd, err: File::NULL)
@@ -305,6 +407,52 @@ module Omarchyfile
       end
     end
 
+    # ---- keybindings
+
+    def bindings_text = File.exist?(BINDINGS_FILE) ? File.read(BINDINGS_FILE) : ""
+
+    # Keys Omarchy binds by default, with their descriptions.
+    def default_bindings
+      Dir.glob(File.join(OMARCHY_PATH, "default/hypr/**/*.lua")).each_with_object({}) do |file, out|
+        File.foreach(file) do |line|
+          next unless (m = line.match(/\A\s*(?:o\.bind|o\.bind_toggle|hl\.bind)\(\s*"([^"]+)"\s*(?:,\s*"([^"]*)")?/))
+
+          out[Keys.normalize(m[1])] ||= m[2].to_s
+        end
+      end
+    end
+
+    def command_available?(command)
+      program = Omarchyfile.program(command).sub(%r{\A~(?=/)}, home)
+      return false if program.empty?
+      return File.executable?(program) if program.include?("/")
+
+      ENV.fetch("PATH", "").split(":").any? { |dir| File.executable?(File.join(dir, program)) }
+    end
+
+    # Writes lines into the omarchyfile block of bindings.lua. Hyprland reloads
+    # the file; if it reports errors, the previous file comes back.
+    def add_bindings(lines)
+      before = bindings_text
+      File.write("#{BINDINGS_FILE}.bak.#{Time.now.to_i}", before) if File.exist?(BINDINGS_FILE)
+      FileUtils.mkdir_p(File.dirname(BINDINGS_FILE))
+      File.write(BINDINGS_FILE, Bindings.insert(before, lines))
+      puts "  #{Style.dim("added #{lines.size} line#{"s" if lines.size > 1} to #{BINDINGS_FILE.sub(home, "~")}")}"
+      return true if hyprland_config_ok?
+
+      File.write(BINDINGS_FILE, before)
+      hyprland_config_ok?
+      puts "  #{Style.warn("Hyprland reported errors, so bindings.lua was put back as it was.")}"
+      false
+    end
+
+    def hyprland_config_ok?
+      system("hyprctl", "reload", out: File::NULL, err: File::NULL)
+      capture("hyprctl", "configerrors").strip.empty?
+    end
+
+    # ---- running things
+
     def run(cmd)
       puts "  #{Style.dim("$ #{Shellwords.join(cmd)}")}"
       system(*cmd)
@@ -322,6 +470,13 @@ module Omarchyfile
       status.success? ? out.lines.map(&:chomp) : nil
     rescue Errno::ENOENT
       raise Error, "--pick needs gum, which ships with Omarchy"
+    end
+
+    def confirm?(question)
+      raise Error, "not a terminal; pass --yes to continue without confirmation" unless $stdin.tty?
+
+      print "#{question} [y/N] "
+      $stdin.gets.to_s.strip.match?(/\Ay(es)?\z/i)
     end
 
     def fetch(url)
@@ -369,13 +524,23 @@ module Omarchyfile
   class Exporter
     Skipped = Struct.new(:what, :reason)
 
+    GROUPS = [
+      [%w[theme], "Theme"],
+      [%w[pkg], "Packages from the Arch and Omarchy repositories"],
+      [%w[aur], "Packages from the AUR"],
+      [%w[webapp], "Web apps"],
+      [%w[plugin], "Plugins"],
+      [%w[widget disable], "Built-in bar widgets you added, changed, or removed"],
+      [%w[unbind bind], "Keybindings (each runs its command when pressed)"],
+    ].freeze
+
     def initialize(machine)
       @machine = machine
       @skipped = []
     end
 
     def entries
-      theme + packages + webapps + plugins + widgets
+      theme + packages + webapps + plugins + widgets + keybindings
     end
 
     def render(list = entries)
@@ -384,23 +549,17 @@ module Omarchyfile
       out << "# An Omarchy setup in one file. Install it on any Omarchy machine with:"
       out << "#   omarchyfile install"
       out << "# Exported #{Time.now.strftime("%Y-%m-%d")} by omarchyfile #{VERSION}."
-      [
-        ["theme", "Theme"],
-        ["pkg", "Packages from the Arch and Omarchy repositories"],
-        ["aur", "Packages from the AUR"],
-        ["webapp", "Web apps"],
-        ["plugin", "Plugins"],
-        [%w[widget disable], "Built-in bar widgets you added, changed, or removed"],
-      ].each do |verbs, title|
-        group = list.select { |e| Array(verbs).include?(e.verb) }
+      GROUPS.each do |verbs, title|
+        group = list.select { |e| verbs.include?(e.verb) }
         next if group.empty?
 
+        group = group.sort_by { |e| e.args[0].downcase } if (verbs & %w[pkg aur webapp]).any?
         out << "" << "# #{title}"
         group.each { |e| out << Writer.line(e) }
       end
       unless @skipped.empty?
         out << "" << "# Not exported:"
-        @skipped.each { |s| out << "#   #{s.what}: #{s.reason}" }
+        @skipped.uniq.each { |s| out << "#   #{s.what}: #{s.reason}" }
       end
       out.join("\n") + "\n"
     end
@@ -481,12 +640,34 @@ module Omarchyfile
       end
       out
     end
+
+    def keybindings
+      found, others = Bindings.parse(@machine.bindings_text)
+      others.each { |keys| @skipped << Skipped.new(keys, "keybinding runs Lua rather than a command") }
+      found.filter_map do |b|
+        unless b[:keys].match?(Parser::KEYS) && (b[:kind] == :unbind || b[:command].match?(Parser::PLAIN)) &&
+               (b[:desc].nil? || b[:desc].empty? || b[:desc].match?(Parser::PLAIN))
+          @skipped << Skipped.new(b[:keys], "keybinding has characters an Omarchyfile cannot hold")
+          next
+        end
+        next Entry.new(verb: "unbind", args: [b[:keys]], opts: {}) if b[:kind] == :unbind
+
+        opts = b[:desc].to_s.empty? ? {} : { "desc" => b[:desc] }
+        Entry.new(verb: "bind", args: [b[:keys], home_relative(b[:command])], opts: opts)
+      end
+    end
+
+    # /home/me/bin/tool becomes ~/bin/tool, so the binding works for anyone.
+    def home_relative(command)
+      command.gsub(%r{(?<![\w/.~-])#{Regexp.escape(@machine.home)}(?=/)}, "~")
+    end
   end
 
   # ------------------------------------------------------------------ plan
 
   # One change the file asks for. `run` performs it; `detail` lines describe it.
-  Step = Struct.new(:category, :label, :detail, :run, keyword_init: true)
+  # Info steps only explain what will be skipped.
+  Step = Struct.new(:category, :label, :detail, :run, :info, keyword_init: true)
 
   class Planner
     def initialize(entries, machine)
@@ -496,7 +677,7 @@ module Omarchyfile
     end
 
     def steps
-      packages + webapps + plugins + bar + theme
+      packages + webapps + plugins + bar + keybindings + theme
     end
 
     private
@@ -562,6 +743,69 @@ module Omarchyfile
                  run: -> { commands.all? { |c| @machine.run(c) } })
       end
     end
+
+    # Adds what is missing, never overrides a key the user bound themselves,
+    # and skips commands this machine does not have.
+    def keybindings
+      wanted = of("bind", "unbind")
+      return [] if wanted.empty?
+
+      current, = Bindings.parse(@machine.bindings_text)
+      bound = current.select { |b| b[:kind] == :bind }.to_h { |b| [Keys.normalize(b[:keys]), b] }
+      unbound = current.select { |b| b[:kind] == :unbind }.map { |b| Keys.normalize(b[:keys]) }.to_set
+      defaults = @machine.default_bindings
+      incoming = of("pkg", "aur").map { |e| e.args[0] }.to_set
+      lines = []
+      detail = []
+      skipped = []
+
+      wanted.each do |e|
+        keys = e.args[0]
+        key = Keys.normalize(keys)
+        if e.verb == "unbind"
+          next if unbound.include?(key)
+
+          unbound << key
+          lines << Bindings.line(e)
+          detail << "turn off #{keys}#{" (Omarchy's \"#{defaults[key]}\")" unless defaults[key].to_s.empty?}"
+          next
+        end
+
+        command = e.args[1]
+        if (mine = bound[key])
+          next if expand(mine[:command]) == expand(command)
+
+          skipped << "#{keys}: you already bound it to #{mine[:command]}"
+          next
+        end
+        program = Omarchyfile.program(command)
+        unless @machine.command_available?(command) || incoming.include?(File.basename(program))
+          skipped << "#{keys}: #{File.basename(program)} is not installed here"
+          next
+        end
+        if defaults.key?(key) && !unbound.include?(key)
+          unbound << key
+          lines << Bindings.line(Entry.new(verb: "unbind", args: [keys], opts: {}))
+          what = defaults[key].to_s.empty? ? "a default" : "\"#{defaults[key]}\""
+          detail << "#{keys} replaces Omarchy's #{what}"
+        end
+        bound[key] = { command: command }
+        lines << Bindings.line(e)
+        detail << "#{keys} runs #{command}#{" (#{e.opts["desc"]})" if e.opts["desc"]}"
+      end
+
+      steps = []
+      unless lines.empty?
+        steps << Step.new(category: "keybindings", label: "Keys", detail: detail, run: -> { @machine.add_bindings(lines) })
+      end
+      unless skipped.empty?
+        steps << Step.new(category: "keybindings", label: "Keys", detail: skipped.map { |s| "skip #{s}" },
+                          run: -> { true }, info: true)
+      end
+      steps
+    end
+
+    def expand(command) = command.to_s.gsub(%r{(?<![\w/.~-])~(?=/)}, @machine.home)
 
     def theme
       entry = of("theme").last or return []
@@ -635,20 +879,24 @@ module Omarchyfile
   def self.print_plan(steps, source)
     puts Style.bold("omarchyfile") + Style.dim(" · #{source}")
     puts
-    if steps.empty?
-      puts "  Everything in this Omarchyfile is already on this machine."
-      return
-    end
+    changes = steps.reject(&:info)
+    puts "  Everything in this Omarchyfile is already on this machine." if changes.empty?
     steps.each do |step|
       step.detail.each_with_index do |line, i|
         label = i.zero? ? step.label : ""
-        puts "  #{Style.bold(label.ljust(10))} #{line}"
+        text = "  #{Style.bold(label.ljust(10))} #{line}"
+        puts step.info ? Style.dim(text) : text
       end
     end
-    if steps.any? { |s| s.category == "plugins" && s.detail.first.start_with?("add ") }
-      puts
-      puts "  " + Style.warn("Plugins run as unsandboxed code in your desktop shell. Only add plugins you trust.")
-    end
+    notes = []
+    notes << "Plugins run as unsandboxed code in your desktop shell. Only add plugins you trust." if
+      changes.any? { |s| s.category == "plugins" && s.detail.first.start_with?("add ") }
+    notes << "Keybindings run their commands when you press them. Check the commands above." if
+      changes.any? { |s| s.category == "keybindings" }
+    return if notes.empty?
+
+    puts
+    notes.each { |n| puts "  " + Style.warn(n) }
   end
 
   # ------------------------------------------------------------------ CLI
@@ -663,11 +911,11 @@ module Omarchyfile
         install [PATH|URL]      Make this machine match an Omarchyfile
 
       Options:
-        --only LIST             Limit to categories: theme,packages,webapps,plugins,bar
-        --yes                   Install without asking for confirmation
+        --pick                  Choose what to export from a checklist
+        --only LIST             Limit to categories: theme,packages,webapps,plugins,bar,keybindings
+        --yes                   Install without asking
         --stdout                Export to standard output instead of a file
         --force                 Overwrite an existing file on export
-        --pick                  Choose what to export from a checklist
         --version               Show the version
     TEXT
 
@@ -689,10 +937,11 @@ module Omarchyfile
       unknown = Array(options[:only]) - CATEGORIES.values.uniq
       raise Error, "unknown category #{unknown.join(", ")} (use #{CATEGORIES.values.uniq.join(", ")})" unless unknown.empty?
 
+      path = args.first || "Omarchyfile"
       case command
-      when "export" then export(args.first || "Omarchyfile", options, machine)
-      when "check" then check(args.first || "Omarchyfile", options, machine)
-      when "install" then install(args.first || "Omarchyfile", options, machine)
+      when "export" then export(path, options, machine)
+      when "check" then check(path, options, machine)
+      when "install" then install(path, options, machine)
       else
         puts USAGE
         command ? 2 : 0
@@ -749,22 +998,24 @@ module Omarchyfile
     def check(source, options, machine)
       steps = plan(source, options, machine)
       Omarchyfile.print_plan(steps, source)
-      steps.empty? ? 0 : 1
+      steps.reject(&:info).empty? ? 0 : 1
     end
 
     def install(source, options, machine)
+      %i[declined failed].include?(apply(source, options, machine)) ? 1 : 0
+    end
+
+    # Returns :none, :applied, :declined, or :failed.
+    def apply(source, options, machine)
       steps = plan(source, options, machine)
       Omarchyfile.print_plan(steps, source)
-      return 0 if steps.empty?
+      changes = steps.reject(&:info)
+      return :none if changes.empty?
 
       puts
-      unless options[:yes]
-        raise Error, "not a terminal; pass --yes to install without confirmation" unless $stdin.tty?
+      return :declined unless options[:yes] || machine.confirm?("Apply #{changes.size} change#{"s" if changes.size > 1}?")
 
-        print "Apply #{steps.size} change#{"s" if steps.size > 1}? [y/N] "
-        return 1 unless $stdin.gets.to_s.strip.match?(/\Ay(es)?\z/i)
-      end
-      failed = steps.reject do |step|
+      failed = changes.reject do |step|
         puts
         puts Style.bold("#{step.label}: #{step.detail.first}")
         step.run.call
@@ -772,13 +1023,14 @@ module Omarchyfile
       puts
       if failed.empty?
         puts "Done. This machine now matches #{source}."
-        0
+        :applied
       else
         puts Style.warn("#{failed.size} change#{"s" if failed.size > 1} failed:")
         failed.each { |s| puts "  #{s.label}: #{s.detail.first}" }
-        1
+        :failed
       end
     end
+
   end
 end
 
