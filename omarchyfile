@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # omarchyfile: describe an Omarchy setup in one file, then export, check,
-# install, or share it. The file is parsed, never executed, so a shared
+# install, share, or sync it. The file is parsed, never executed, so a shared
 # Omarchyfile can only name things to install. It cannot run code of its own.
 
 require "fileutils"
@@ -485,6 +485,16 @@ module Omarchyfile
       raise Error, "sharing needs the GitHub CLI. Install it with: omarchy pkg add github-cli"
     end
 
+    # ---- git, for sync
+
+    def git_root(path)
+      root = capture("git", "-C", File.dirname(File.expand_path(path)), "rev-parse", "--show-toplevel").strip
+      root.empty? ? nil : root
+    end
+
+    def git_upstream?(repo) = !capture("git", "-C", repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").strip.empty?
+    def hostname = capture("uname", "-n").strip
+
     # ---- running things
 
     def run(cmd)
@@ -694,6 +704,28 @@ module Omarchyfile
     # /home/me/bin/tool becomes ~/bin/tool, so the binding works for anyone.
     def home_relative(command)
       command.gsub(%r{(?<![\w/.~-])#{Regexp.escape(@machine.home)}(?=/)}, "~")
+    end
+  end
+
+  # ------------------------------------------------------------------ merge, for sync
+
+  module Merge
+    module_function
+
+    def key(entry)
+      case entry.verb
+      when "theme" then ["theme"]
+      when "plugin" then ["plugin", Omarchyfile.normalize_repo(entry.args[0])]
+      when "widget", "disable" then ["bar", entry.args[0]]
+      when "bind", "unbind" then [entry.verb, Keys.normalize(entry.args[0])]
+      else [entry.verb, entry.args[0]]
+      end
+    end
+
+    # This machine's entries, plus the file's entries this machine lacks. Nothing is dropped.
+    def call(file_entries, machine_entries)
+      have = machine_entries.map { |e| key(e) }.to_set
+      machine_entries + file_entries.reject { |e| have.include?(key(e)) }
     end
   end
 
@@ -947,11 +979,12 @@ module Omarchyfile
         check [PATH|URL]        Show what install would change, without changing anything
         install [PATH|URL]      Make this machine match an Omarchyfile
         share [PATH]            Share an Omarchyfile as a GitHub gist and print its install command
+        sync [PATH]             Pull, install, add this machine's changes, commit, and push
 
       Options:
         --pick                  Choose what to export from a checklist
         --only LIST             Limit to categories: theme,packages,webapps,plugins,bar,keybindings
-        --yes                   Install or share without asking
+        --yes                   Install, share, or sync without asking
         --public                Share as a public gist (default: secret, visible to anyone with the link)
         --new                   Share as a new gist instead of updating the last one
         --stdout                Export to standard output instead of a file
@@ -985,6 +1018,7 @@ module Omarchyfile
       when "check" then check(path, options, machine)
       when "install" then install(path, options, machine)
       when "share" then share(path, options, machine)
+      when "sync" then sync(path, options, machine)
       else
         puts USAGE
         command ? 2 : 0
@@ -1120,6 +1154,42 @@ module Omarchyfile
       parts.empty? ? "An empty Omarchyfile" : parts.join(", ")
     end
 
+    def sync(path, options, machine)
+      raise Error, "no Omarchyfile at #{path}. Run 'omarchyfile export' inside your dotfiles repository first." unless File.exist?(path)
+
+      repo = machine.git_root(path) or
+        raise Error, "sync keeps #{path} in a git repository. Move it into your dotfiles repository, or run 'git init' in its folder."
+      upstream = machine.git_upstream?(repo)
+      if upstream && !machine.run(["git", "-C", repo, "pull", "--rebase", "--autostash"])
+        raise Error, "git pull failed in #{repo}. Resolve it, then run sync again."
+      end
+
+      result = apply(path, options, machine)
+      return 1 if result == :declined
+
+      before = File.read(path)
+      exporter = Exporter.new(machine)
+      text = exporter.render(Merge.call(Parser.parse(before), exporter.entries))
+      if entry_lines(text) == entry_lines(before)
+        puts
+        puts "#{path} already lists everything on this machine."
+      else
+        File.write(path, text)
+        file = File.expand_path(path)
+        host = machine.hostname
+        machine.run(["git", "-C", repo, "add", "--", file]) &&
+          machine.run(["git", "-C", repo, "commit", "-m", "omarchyfile: sync from #{host.empty? ? "this machine" : host}", "--", file]) or
+          raise Error, "git commit failed in #{repo}"
+        if upstream && !machine.run(["git", "-C", repo, "push"])
+          raise Error, "git push failed. The commit is saved locally; push it when you can."
+        end
+        puts
+        puts "Added this machine's changes to #{path}#{" and pushed them" if upstream}."
+      end
+      result == :failed ? 1 : 0
+    end
+
+    def entry_lines(text) = text.lines.map(&:strip).reject { |l| l.empty? || l.start_with?("#") }.sort
   end
 end
 

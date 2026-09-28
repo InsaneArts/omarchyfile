@@ -521,6 +521,53 @@ test "summarizes what a share contains" do
   eq Omarchyfile::CLI.summary(entries), "theme, 2 packages, 1 web app, 1 keybinding"
 end
 
+# ---------------------------------------------------------------- sync
+
+test "merge keeps every file entry and adds this machine's" do
+  file = P.parse(%(pkg "btop"\npkg "only-on-laptop"\nplugin "#{SPACES}.git", bar: "left"\nbind "super+a", "a"\n))
+  mine = P.parse(%(pkg "btop"\npkg "yazi"\nplugin "#{SPACES}", bar: "right"\nbind "SUPER + A", "b"\n))
+  merged = Omarchyfile::Merge.call(file, mine)
+  eq merged.map { |e| Omarchyfile::Writer.line(e) }, [
+    %(pkg "btop"), %(pkg "yazi"), %(plugin "#{SPACES}", bar: "right"), %(bind "SUPER + A", "b"), %(pkg "only-on-laptop"),
+  ]
+end
+
+test "sync installs, merges, commits, and pushes" do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "Omarchyfile")
+    File.write(path, %(pkg "btop"\npkg "only-on-laptop"\n))
+    m = FakeMachine.new(installed: %w[btop yazi], native: %w[btop yazi], git_root: dir, upstream: true)
+    eq quietly { Omarchyfile::CLI.run(["sync", path, "--yes"], machine: m) }, 0
+    eq m.ran.map { |c| c[0..3] }, [
+      ["git", "-C", dir, "pull"],
+      %w[omarchy pkg add only-on-laptop],
+      ["git", "-C", dir, "add"],
+      ["git", "-C", dir, "commit"],
+      ["git", "-C", dir, "push"],
+    ]
+    text = File.read(path)
+    %w[btop yazi only-on-laptop].each { |p| raise "#{p} missing after sync" unless text.include?(%(pkg "#{p}")) }
+  end
+end
+
+test "sync does not commit when nothing changed" do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "Omarchyfile")
+    File.write(path, %(theme "solitude"\npkg "yazi"\n))
+    m = FakeMachine.new(installed: %w[yazi], native: %w[yazi], git_root: dir)
+    eq quietly { Omarchyfile::CLI.run(["sync", path, "--yes"], machine: m) }, 0
+    eq m.ran, []
+  end
+end
+
+test "sync explains how to start when there is no repository" do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "Omarchyfile")
+    File.write(path, %(pkg "yazi"\n))
+    raises(/git repository/) { Omarchyfile::CLI.sync(path, { yes: true }, FakeMachine.new) }
+  end
+end
+
 if $failed.positive?
   puts "#{$failed} failed"
   exit 1
