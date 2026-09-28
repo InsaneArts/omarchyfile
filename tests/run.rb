@@ -486,6 +486,41 @@ test "rejects bindings that are not key combinations" do
   raises(/needs a command/) { P.parse(%(bind "SUPER + X", "   ")) }
 end
 
+# ---------------------------------------------------------------- share
+
+test "share creates a secret gist, then updates the same one" do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "Omarchyfile")
+    File.write(path, %(pkg "btop"\n))
+    m = FakeMachine.new
+    out = nil
+    eq quietly { Omarchyfile::CLI.run(["share", path, "--yes"], machine: m) }, 0
+    url = m.shares[File.expand_path(path)]["url"]
+    eq m.gists[url], [%(pkg "btop"\n), false]
+    File.write(path, %(pkg "btop"\npkg "yazi"\n))
+    eq quietly { Omarchyfile::CLI.run(["share", path, "--yes"], machine: m) }, 0
+    eq m.gists.size, 1
+    eq m.gists[url][0], %(pkg "btop"\npkg "yazi"\n)
+    eq quietly { Omarchyfile::CLI.run(["share", path, "--yes", "--new"], machine: m) }, 0
+    eq m.gists.size, 2
+  end
+end
+
+test "share asks first and stops when declined" do
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "Omarchyfile")
+    File.write(path, %(pkg "btop"\n))
+    m = FakeMachine.new(confirm: false)
+    eq quietly { Omarchyfile::CLI.run(["share", path], machine: m) }, 1
+    eq m.gists, {}
+  end
+end
+
+test "summarizes what a share contains" do
+  entries = P.parse(%(theme "ash"\npkg "a"\naur "b"\nwebapp "X", "https://x.com"\nbind "SUPER + A", "a"\n))
+  eq Omarchyfile::CLI.summary(entries), "theme, 2 packages, 1 web app, 1 keybinding"
+end
+
 if $failed.positive?
   puts "#{$failed} failed"
   exit 1

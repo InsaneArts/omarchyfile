@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # omarchyfile: describe an Omarchy setup in one file, then export, check,
-# or install it. The file is parsed, never executed, so a shared
+# install, or share it. The file is parsed, never executed, so a shared
 # Omarchyfile can only name things to install. It cannot run code of its own.
 
 require "fileutils"
@@ -449,6 +449,40 @@ module Omarchyfile
     def hyprland_config_ok?
       system("hyprctl", "reload", out: File::NULL, err: File::NULL)
       capture("hyprctl", "configerrors").strip.empty?
+    end
+
+    # ---- sharing
+
+    def shares = read_json(File.join(STATE_DIR, "shares.json")) || {}
+
+    def save_shares(map)
+      FileUtils.mkdir_p(STATE_DIR)
+      File.write(File.join(STATE_DIR, "shares.json"), JSON.pretty_generate(map))
+    end
+
+    def gist_create(text, public:)
+      out, status = Open3.capture2(
+        "gh", "gist", "create", "--filename", "Omarchyfile", "--desc", "My Omarchy setup, made with omarchyfile",
+        *(public ? ["--public"] : []), "-",
+        stdin_data: text, err: File::NULL
+      )
+      url = out.lines.map(&:strip).find { |l| l.start_with?("https://") }
+      raise Error, "gh could not create the gist. Check 'gh auth status' and try again." unless status.success? && url
+
+      url
+    rescue Errno::ENOENT
+      raise Error, "sharing needs the GitHub CLI. Install it with: omarchy pkg add github-cli"
+    end
+
+    def gist_update(url, text)
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "Omarchyfile")
+        File.write(path, text)
+        _, status = Open3.capture2e("gh", "gist", "edit", url, "--filename", "Omarchyfile", path)
+        status.success?
+      end
+    rescue Errno::ENOENT
+      raise Error, "sharing needs the GitHub CLI. Install it with: omarchy pkg add github-cli"
     end
 
     # ---- running things
@@ -902,6 +936,9 @@ module Omarchyfile
   # ------------------------------------------------------------------ CLI
 
   module CLI
+    INSTALL_TOOL = "curl -fsSL https://raw.githubusercontent.com/InsaneArts/omarchyfile/main/omarchyfile " \
+                   "-o ~/.local/bin/omarchyfile && chmod +x ~/.local/bin/omarchyfile"
+
     USAGE = <<~TEXT
       Usage: omarchyfile <command> [options]
 
@@ -909,11 +946,14 @@ module Omarchyfile
         export [PATH]           Write this machine's setup to an Omarchyfile (default ./Omarchyfile)
         check [PATH|URL]        Show what install would change, without changing anything
         install [PATH|URL]      Make this machine match an Omarchyfile
+        share [PATH]            Share an Omarchyfile as a GitHub gist and print its install command
 
       Options:
         --pick                  Choose what to export from a checklist
         --only LIST             Limit to categories: theme,packages,webapps,plugins,bar,keybindings
-        --yes                   Install without asking
+        --yes                   Install or share without asking
+        --public                Share as a public gist (default: secret, visible to anyone with the link)
+        --new                   Share as a new gist instead of updating the last one
         --stdout                Export to standard output instead of a file
         --force                 Overwrite an existing file on export
         --version               Show the version
@@ -922,13 +962,15 @@ module Omarchyfile
     module_function
 
     def run(argv, machine: Machine.new)
-      options = { only: nil, yes: false, stdout: false, force: false, pick: false }
+      options = { only: nil, yes: false, stdout: false, force: false, pick: false, public: false, new: false }
       parser = OptionParser.new do |o|
         o.on("--only LIST") { |v| options[:only] = v.split(",").map(&:strip) }
         o.on("--yes") { options[:yes] = true }
         o.on("--stdout") { options[:stdout] = true }
         o.on("--force") { options[:force] = true }
         o.on("--pick") { options[:pick] = true }
+        o.on("--public") { options[:public] = true }
+        o.on("--new") { options[:new] = true }
         o.on("--version") { puts "omarchyfile #{VERSION}"; return 0 }
         o.on("-h", "--help") { puts USAGE; return 0 }
       end
@@ -942,6 +984,7 @@ module Omarchyfile
       when "export" then export(path, options, machine)
       when "check" then check(path, options, machine)
       when "install" then install(path, options, machine)
+      when "share" then share(path, options, machine)
       else
         puts USAGE
         command ? 2 : 0
@@ -1029,6 +1072,52 @@ module Omarchyfile
         failed.each { |s| puts "  #{s.label}: #{s.detail.first}" }
         :failed
       end
+    end
+
+    def share(path, options, machine)
+      unless File.exist?(path)
+        code = export(path, options.merge(stdout: false), machine)
+        return code unless code.zero?
+      end
+      text = File.read(path)
+      entries = Parser.parse(text)
+      key = File.expand_path(path)
+      shares = machine.shares
+      existing = options[:new] ? nil : shares[key]
+      existing = nil if existing && options[:public] && !existing["public"]
+
+      puts Style.bold("omarchyfile") + Style.dim(" · sharing #{path}")
+      puts
+      puts "  #{summary(entries)}"
+      puts "  Anyone with the link can read it, including web app URLs and keybinding commands."
+      puts "  It will also be listed on your GitHub profile." if options[:public]
+      puts "  This updates your earlier share: #{existing["url"]}" if existing
+      puts
+      return 1 unless options[:yes] || machine.confirm?("Share it?")
+
+      url = existing && machine.gist_update(existing["url"], text) ? existing["url"] : machine.gist_create(text, public: options[:public])
+      shares[key] = { "url" => url, "public" => options[:public] || (existing && existing["public"]) || false }
+      machine.save_shares(shares)
+      puts
+      puts "Shared: #{url}"
+      puts
+      puts "Anyone on Omarchy can set up the same with:"
+      puts "  omarchyfile install #{url}"
+      puts
+      puts Style.dim("Don't have omarchyfile yet? #{INSTALL_TOOL}")
+      0
+    end
+
+    def summary(entries)
+      counts = entries.group_by(&:category).transform_values(&:size)
+      parts = []
+      parts << "theme" if counts["theme"]
+      { "packages" => "package", "webapps" => "web app", "plugins" => "plugin", "bar" => "bar change",
+        "keybindings" => "keybinding" }.each do |category, noun|
+        n = counts[category] or next
+        parts << "#{n} #{noun}#{"s" if n > 1}"
+      end
+      parts.empty? ? "An empty Omarchyfile" : parts.join(", ")
     end
 
   end
